@@ -334,6 +334,20 @@ def test_collect_malformed_ipv6_does_not_500(client, auth):
     assert res.status_code == 400
 
 
+def test_collect_deeply_nested_json_returns_400(client, auth):
+    # P1-1 回归：深度嵌套 JSON 不应让公开上报接口抛 500。
+    # 注意嵌套必须是 JSON 结构本身（裸的 [[..]]），放在字符串值里只是普通字符、
+    # 触发不了 json 的递归；本环境 Python 3.12 下 20000 层稳定触发 RecursionError
+    # （已实测）；正文约 40KB，低于上报接口 64KB 与框架 128KB 上限，走得到 json.loads。
+    site = mk_site(client, auth, "嵌套站", "nested.example.com")
+    assert site["site_id"]  # 建站成功，正文用裸嵌套数组直击 json.loads
+    body = "[" * 20000 + "]" * 20000
+    assert len(body) < 64 * 1024
+    res = client.post("/api/collect", content=body)
+    assert res.status_code == 400
+    assert "合法 JSON" in res.json()["detail"]
+
+
 def test_collect_invalid_url_rejected(client, auth):
     site = mk_site(client, auth, "校验站", "validate.example.com")
     res = client.post(
