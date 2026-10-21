@@ -175,6 +175,38 @@ def test_docs_endpoints_closed_by_default(client):
     assert client.get("/openapi.json").status_code == 404
 
 
+def test_session_token_stored_hashed_not_plaintext(client):
+    # P1-1 回归：会话令牌入库为 SHA-256 哈希而非明文，原始令牌仍可用。
+    data = do_login(client)
+    token = data["token"]
+    expected = appmod.session_key(token)
+    assert len(expected) == 64
+    rows = db_rows("SELECT token FROM sessions WHERE token = ?", (expected,))
+    assert len(rows) == 1
+    assert rows[0]["token"] != token
+    # 原始令牌仍可用
+    res = client.get("/api/me", headers={"Authorization": f"Bearer {token}"})
+    assert res.status_code == 200
+    # 登出后该令牌 401
+    res = client.post("/api/logout", headers={"Authorization": f"Bearer {token}"})
+    assert res.status_code == 200
+    res = client.get("/api/me", headers={"Authorization": f"Bearer {token}"})
+    assert res.status_code == 401
+
+
+def test_request_body_hard_limit_413(client, auth):
+    # P1-2 回归：超过 128KiB 的正文由框架直接回 413。
+    big_login = json.dumps({"username": "admin", "password": "x" * (140 * 1024)})
+    res = client.post("/api/login", content=big_login)
+    assert res.status_code == 413
+    # 64KB~128KB 之间的上报仍走路由自带的 64KB 检查（400），不被框架 413 抢走。
+    site = mk_site(client, auth, "限流站", "bodylimit.example.com")
+    mid = json.dumps({"site_id": site["site_id"], "url": "/" + "x" * (70 * 1024)})
+    res = client.post("/api/collect", content=mid)
+    assert res.status_code == 400
+    assert "过大" in res.json()["detail"]
+
+
 # ----------------------------------------------------------------- sites ----
 
 def test_create_site_normalizes_domain_and_builds_snippet(client, auth):
