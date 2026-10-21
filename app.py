@@ -715,7 +715,8 @@ async def collect(request: Request):
     if raw_body:
         try:
             data = json.loads(raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            # 深度嵌套会在解码时打满递归上限；公开上报接口应返回 400，而不是 500。
             raise HTTPException(status_code=400, detail="请求体不是合法 JSON")
     else:
         data = {}
