@@ -202,9 +202,19 @@ def get_uv_salt(conn: sqlite3.Connection) -> str:
     if row is not None:
         return row["value"]
     salt = secrets.token_hex(32)
-    conn.execute(
-        "INSERT INTO settings (key, value) VALUES ('uv_salt', ?)", (salt,)
-    )
+    try:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('uv_salt', ?)", (salt,)
+        )
+    except sqlite3.IntegrityError:
+        # 并发首次写入撞主键：回滚掉失败的 INSERT，读对方已提交的盐。
+        conn.rollback()
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'uv_salt'"
+        ).fetchone()
+        if row is None:
+            raise
+        return row["value"]
     return salt
 
 
