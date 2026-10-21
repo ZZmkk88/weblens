@@ -107,3 +107,20 @@ try/except，无范围外改动；测试文件未动。
   （starlette 1.9.0）。配回归测试 `test_request_body_hard_limit_413`。
 - P2 九条不动（Grok 自己标不修；P2-4/P2-7 按 D-6 关闭）。
 - 审查结论：分支未动测试文件；无口径冲突。
+
+## D-10 TASK-065-weblens 收口决定（2026-10-21）
+
+该分支基座落后 main 3 个提交（00c1a38 vs 1acc81b：TASK-061 fix、TASK-061
+回归测试、D-9 文档），未整支合并，只手工搬运与报告声称一致的唯一改动
+（app.py +2/-1；测试文件未动）。回退检查：分支仍含 session_key() 令牌哈希、
+MAX_REQUEST_BODY 128KiB 上限、TASK-058 的 IPv6 兜底，无回退无重复。
+
+- 采纳 P1-1：`/api/collect` 的 `json.loads` except 增加 `RecursionError`，
+  深度嵌套 JSON 由未捕获的 500 改为 400「请求体不是合法 JSON」。Grok 在真实
+  服务上验证过修复前 500→修复后 400。配回归测试
+  `test_collect_deeply_nested_json_returns_400`（20000 层嵌套，本环境
+  Python 3.12 下稳定触发 RecursionError，正文约 40KB，走得到 json.loads）。
+- P2 九条全部不改（其中 3 条已决事项按 DECISIONS 维持）。
+- 审查结论：无"强制改密"回潮（口径#1，报告主动引用 D-1/D-2/D-3/D-6/D-8）；
+  /docs 三入口 404 关闭；WEBLENS_HOST 口径一致；改密吊销留本次一致；
+  P2-7（X-Forwarded-For）/P2-8（访客哈希）维持 D-6/D-8 不改。
