@@ -6,6 +6,7 @@ referrer domains from a single dashboard. Single-file FastAPI backend +
 SQLite + one static page. Design notes live in NOTES.md.
 """
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -58,6 +59,18 @@ def hash_password(password: str, salt_hex: str) -> str:
     return hashlib.pbkdf2_hmac(
         "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), 200_000
     ).hex()
+
+
+# 用户不存在时仍走一遍 PBKDF2，避免用响应时间判断用户名。这组值不对应任何账号。
+_UNKNOWN_USER_SALT = "00" * 16
+_UNKNOWN_USER_HASH = "0" * 64
+
+
+def password_matches(password: str, salt_hex: str, expected_hex: str) -> bool:
+    actual = hash_password(password, salt_hex)
+    if len(actual) != len(expected_hex):
+        return False
+    return hmac.compare_digest(actual, expected_hex)
 
 
 def session_key(token: str) -> str:
@@ -405,7 +418,10 @@ def login(body: LoginIn):
         user = conn.execute(
             "SELECT * FROM users WHERE username = ?", (body.username.strip(),)
         ).fetchone()
-        if user is None or hash_password(body.password, user["salt"]) != user["password_hash"]:
+        if user is None:
+            password_matches(body.password, _UNKNOWN_USER_SALT, _UNKNOWN_USER_HASH)
+            raise HTTPException(status_code=401, detail="用户名或密码不正确")
+        if not password_matches(body.password, user["salt"], user["password_hash"]):
             raise HTTPException(status_code=401, detail="用户名或密码不正确")
         token = secrets.token_urlsafe(32)
         conn.execute(
@@ -435,7 +451,7 @@ def change_password(
 ):
     if len(body.new_password) < 6:
         raise HTTPException(status_code=400, detail="新密码至少 6 位")
-    if hash_password(body.old_password, user["salt"]) != user["password_hash"]:
+    if not password_matches(body.old_password, user["salt"], user["password_hash"]):
         raise HTTPException(status_code=400, detail="旧密码不正确")
     # 口径#2：本次请求携带的令牌就是当前会话，改密时保留它。
     auth_header = request.headers.get("Authorization", "")
