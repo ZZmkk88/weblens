@@ -72,6 +72,19 @@ def hash_password(password: str, salt_hex: str) -> str:
     ).hex()
 
 
+# 用户不存在时仍走一遍 PBKDF2，避免用响应时间判断用户名是否存在。
+# 这组值不对应任何真实账号，只为凑足同样的计算量。
+_UNKNOWN_USER_SALT = "00" * 16
+_UNKNOWN_USER_HASH = "0" * 64
+
+
+def password_matches(password: str, salt_hex: str, expected_hex: str) -> bool:
+    # 口径#8：敏感比对用 secrets.compare_digest，避免时序侧信道。
+    # （hash_password 内的代理字符检查先抛 400，与调用方行为一致。）
+    actual = hash_password(password, salt_hex)
+    return secrets.compare_digest(actual, expected_hex)
+
+
 def session_key(token: str) -> str:
     # 会话令牌熵足够（token_urlsafe 32 字节），库里只存 SHA-256，不必再加盐。
     # 接口返回给客户端的仍是原始令牌。
@@ -428,10 +441,13 @@ def login(body: LoginIn):
         user = conn.execute(
             "SELECT * FROM users WHERE username = ?", (username,)
         ).fetchone()
-        # 口径#8：敏感比对用 secrets.compare_digest，避免时序侧信道。
-        if user is None or not secrets.compare_digest(
-            hash_password(body.password, user["salt"]), user["password_hash"]
-        ):
+        # 用户不存在时也跑一遍 PBKDF2（哑盐），再返回 401：
+        # 否则"用户名不存在"（直接返回）和"密码错误"（跑完 PBKDF2 才返回）
+        # 的响应时间差几十毫秒，可被用来枚举有效用户名。
+        if user is None:
+            password_matches(body.password, _UNKNOWN_USER_SALT, _UNKNOWN_USER_HASH)
+            raise HTTPException(status_code=401, detail="用户名或密码不正确")
+        if not password_matches(body.password, user["salt"], user["password_hash"]):
             raise HTTPException(status_code=401, detail="用户名或密码不正确")
         token = secrets.token_urlsafe(32)
         conn.execute(
@@ -465,10 +481,8 @@ def change_password(
 ):
     if len(body.new_password) < 6:
         raise HTTPException(status_code=400, detail="新密码至少 6 位")
-    # 口径#8：敏感比对用 secrets.compare_digest，避免时序侧信道。
-    if not secrets.compare_digest(
-        hash_password(body.old_password, user["salt"]), user["password_hash"]
-    ):
+    # 口径#8：敏感比对走 password_matches（PBKDF2 + secrets.compare_digest）。
+    if not password_matches(body.old_password, user["salt"], user["password_hash"]):
         raise HTTPException(status_code=400, detail="旧密码不正确")
     # 口径#2：本次请求携带的令牌就是当前会话，改密时保留它。
     auth_header = request.headers.get("Authorization", "")
