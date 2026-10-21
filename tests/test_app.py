@@ -261,6 +261,47 @@ def test_collect_body_too_large_rejected(client, auth):
     assert "过大" in res.json()["detail"]
 
 
+def test_collect_malformed_ipv6_does_not_500(client, auth):
+    # P1-1 回归：畸形 IPv6（如 http://[）不能让公开上报接口抛 500 丢记录。
+    site = mk_site(client, auth, "畸形站", "malformed.example.com")
+    # 坏来源：记空串，这次访问照常入库
+    res = client.post(
+        "/api/collect",
+        json={"site_id": site["site_id"], "url": "/kept", "referrer": "http://["},
+        headers={"User-Agent": CHROME_WIN},
+    )
+    assert res.status_code == 201, res.text
+    rows = db_rows(
+        "SELECT * FROM pageviews WHERE site_id = ? AND page_path = '/kept'",
+        (site["id"],),
+    )
+    assert len(rows) == 1
+    assert rows[0]["referrer_domain"] == ""
+    # 合法 IPv6 来源不受影响
+    res = client.post(
+        "/api/collect",
+        json={
+            "site_id": site["site_id"],
+            "url": "/v6",
+            "referrer": "http://[::1]/x",
+        },
+        headers={"User-Agent": CHROME_WIN},
+    )
+    assert res.status_code == 201, res.text
+    # 坏页面地址：400，不抛 500
+    res = client.post(
+        "/api/collect",
+        json={"site_id": site["site_id"], "url": "http://["},
+        headers={"User-Agent": CHROME_WIN},
+    )
+    assert res.status_code == 400
+    # 坏建站域名：400
+    res = client.post(
+        "/api/sites", json={"name": "坏", "domain": "http://["}, headers=auth
+    )
+    assert res.status_code == 400
+
+
 def test_collect_invalid_url_rejected(client, auth):
     site = mk_site(client, auth, "校验站", "validate.example.com")
     res = client.post(
@@ -403,6 +444,14 @@ def test_homepage_and_tracker_script(client):
     assert tracker.status_code == 200
     assert "data-weblens-id" in tracker.text
     assert "/api/collect" in tracker.text
+
+
+def test_security_headers_present(client):
+    # P2-5：防点击劫持与 MIME 嗅探响应头
+    for path in ("/", "/tracker.js", "/api/collect"):
+        res = client.get(path) if path != "/api/collect" else client.options(path)
+        assert res.headers.get("x-frame-options") == "DENY", path
+        assert res.headers.get("x-content-type-options") == "nosniff", path
 
 
 def test_delete_site_cascades_pageviews(client, auth):
