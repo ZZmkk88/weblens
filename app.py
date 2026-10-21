@@ -202,9 +202,18 @@ def get_uv_salt(conn: sqlite3.Connection) -> str:
     if row is not None:
         return row["value"]
     salt = secrets.token_hex(32)
-    conn.execute(
-        "INSERT INTO settings (key, value) VALUES ('uv_salt', ?)", (salt,)
-    )
+    try:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('uv_salt', ?)", (salt,)
+        )
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'uv_salt'"
+        ).fetchone()
+        if row is None:
+            raise
+        return row["value"]
     return salt
 
 
@@ -294,7 +303,13 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="weblens", lifespan=lifespan)
+app = FastAPI(
+    title="weblens",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -578,6 +593,11 @@ def site_stats(
             " ORDER BY count DESC, referrer_domain ASC LIMIT 10",
             (site_pk, start, end),
         ).fetchall()
+        active_pages_row = conn.execute(
+            "SELECT COUNT(DISTINCT page_path) AS active_pages FROM pageviews"
+            " WHERE site_id = ? AND view_date BETWEEN ? AND ?",
+            (site_pk, start, end),
+        ).fetchone()
 
     by_date = {row["view_date"]: row for row in trend_rows}
     trend = []
@@ -600,6 +620,7 @@ def site_stats(
             "end_date": end,
         },
         "totals": {"pv": totals["pv"], "uv": totals["uv"]},
+        "active_pages": active_pages_row["active_pages"],
         "trend": trend,
         "top_pages": [
             {"path": row["page_path"], "count": row["count"]} for row in top_pages
@@ -659,12 +680,7 @@ async def collect(request: Request):
             or ""
         )
         referrer_domain = domain_from_value(str(referrer_value))
-    user_agent = str(
-        payload.get("user_agent")
-        or payload.get("userAgent")
-        or request.headers.get("user-agent")
-        or ""
-    )
+    user_agent = request.headers.get("user-agent") or ""
     ua_class = classify_user_agent(user_agent)
     now = utcnow()
     view_date = now.date().isoformat()
