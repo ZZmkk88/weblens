@@ -44,10 +44,13 @@ python app.py
 
 | 变量 | 说明 | 默认 |
 |---|---|---|
-| `WEBLENS_PORT` | 监听端口 | `8000` |
+| `WEBLENS_HOST` | 监听地址；默认只监听本机 | `127.0.0.1` |
+| `WEBLENS_PORT` | 监听端口（未设置时再看 `PORT`） | `8000` |
 | `WEBLENS_DB_PATH` | SQLite 数据库文件位置 | `data/weblens.db` |
 | `WL_INITIAL_USERNAME` / `WL_INITIAL_PASSWORD` | 首次启动创建的初始账号 | `admin` / `admin123` |
 | `WEBLENS_UV_SALT` | UV 哈希盐；不设置时首次启动在本机数据库中生成 | 无 |
+
+> 需要局域网或对外访问时，把 `WEBLENS_HOST` 改成 `0.0.0.0`；放开前请先改掉默认密码。
 
 ## 接入一个网站
 
@@ -78,6 +81,7 @@ python app.py
 - `url` 可传完整 URL 或页面路径，入库时只保留路径部分。
 - `referrer` 可传完整来源 URL，入库时只保留站外来源域名。
 - User-Agent 从请求头读取并只保存浏览器、系统、设备三类粗分类。
+- 请求体超过 64KB 时返回 400。
 
 ## 测试
 
