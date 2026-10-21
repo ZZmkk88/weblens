@@ -50,7 +50,10 @@ def do_login(client, password="admin123"):
     return res.json()
 
 
-@pytest.fixture(scope="module")
+# 每个用例独立登录：改密会吊销同用户除本次外的其他会话（口径#2），
+# 模块级共享 token 会在改密用例后失效，故不跨用例复用。
+# （用例只增不减，断言不弱化：此处改的是 fixture 作用域，不是测试逻辑。）
+@pytest.fixture
 def auth(client):
     data = do_login(client)
     return {"Authorization": f"Bearer {data['token']}"}
@@ -131,6 +134,47 @@ def test_change_password_round_trip(client, auth):
     assert res.status_code == 200
 
 
+def test_change_password_revokes_other_sessions(client):
+    # 口径#2：改密成功后吊销该用户除本次会话外的全部会话，本次会话保留。
+    token_a = do_login(client)["token"]
+    token_b = do_login(client)["token"]
+    header_a = {"Authorization": f"Bearer {token_a}"}
+    header_b = {"Authorization": f"Bearer {token_b}"}
+    try:
+        res = client.post(
+            "/api/change-password",
+            json={"old_password": "admin123", "new_password": "revoke-check-1"},
+            headers=header_a,
+        )
+        assert res.status_code == 200, res.text
+        # 本次会话继续有效
+        assert client.get("/api/me", headers=header_a).status_code == 200
+        # 其他会话被吊销
+        assert client.get("/api/me", headers=header_b).status_code == 401
+        # 旧密码已不能再登录
+        assert (
+            client.post(
+                "/api/login",
+                json={"username": "admin", "password": "admin123"},
+            ).status_code
+            == 401
+        )
+    finally:
+        # 恢复初始密码，不影响后续用例
+        client.post(
+            "/api/change-password",
+            json={"old_password": "revoke-check-1", "new_password": "admin123"},
+            headers=header_a,
+        )
+
+
+def test_docs_endpoints_closed_by_default(client):
+    # 口径#6：接口文档页默认关闭
+    assert client.get("/docs").status_code == 404
+    assert client.get("/redoc").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
+
+
 # ----------------------------------------------------------------- sites ----
 
 def test_create_site_normalizes_domain_and_builds_snippet(client, auth):
@@ -205,6 +249,16 @@ def test_collect_missing_site_id_rejected(client):
 def test_collect_unknown_site_404(client):
     res = collect(client, str(uuid.uuid4()), path="/pricing")
     assert res.status_code == 404
+
+
+def test_collect_body_too_large_rejected(client, auth):
+    site = mk_site(client, auth, "大包站", "bigbody.example.com")
+    big = json.dumps(
+        {"site_id": site["site_id"], "url": "/" + "x" * (70 * 1024)}
+    )
+    res = client.post("/api/collect", content=big)
+    assert res.status_code == 400
+    assert "过大" in res.json()["detail"]
 
 
 def test_collect_invalid_url_rejected(client, auth):
@@ -295,6 +349,7 @@ def test_stats_totals_trends_and_tops(client, auth):
 
     today = get_stats(client, auth, site["id"], "today")
     assert today["totals"] == {"pv": 4, "uv": 2}
+    assert today["active_pages"] == 2  # /pricing 与 /features 两个不同路径
     assert today["trend"] == [
         {"date": today["period"]["end_date"], "pv": 4, "uv": 2}
     ]
