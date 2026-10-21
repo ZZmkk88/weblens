@@ -19,8 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -32,6 +31,7 @@ MAX_SITE_NAME = 80
 MAX_DOMAIN_LENGTH = 253
 MAX_PAGE_PATH = 1000
 MAX_URL_LENGTH = 2048
+MAX_COLLECT_BODY = 64 * 1024
 HOST_RE = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
     r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
@@ -294,14 +294,23 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="weblens", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# 口径#6：接口文档页默认关闭（/docs、/redoc、/openapi.json 未登录可访问视为问题）
+app = FastAPI(
+    title="weblens",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
+
+
+# Cross-origin access is only for the public tracker. Login and the
+# dashboard stay same-origin so a random page cannot read them.
+COLLECT_CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
 
 
 class LoginIn(BaseModel):
@@ -370,18 +379,36 @@ def logout(request: Request, user: sqlite3.Row = Depends(current_user)):
 
 
 @app.post("/api/change-password")
-def change_password(body: ChangePasswordIn, user: sqlite3.Row = Depends(current_user)):
+def change_password(
+    body: ChangePasswordIn,
+    request: Request,
+    user: sqlite3.Row = Depends(current_user),
+):
     if len(body.new_password) < 6:
         raise HTTPException(status_code=400, detail="新密码至少 6 位")
     if hash_password(body.old_password, user["salt"]) != user["password_hash"]:
         raise HTTPException(status_code=400, detail="旧密码不正确")
+    # 口径#2：本次请求携带的令牌就是当前会话，改密时保留它。
+    auth_header = request.headers.get("Authorization", "")
+    current_token = (
+        auth_header[len("Bearer "):].strip()
+        if auth_header.startswith("Bearer ")
+        else ""
+    )
     salt = secrets.token_hex(16)
     with get_conn() as conn:
+        # 密码更新与会话吊销在同一事务里，要么一起生效要么一起回滚。
         conn.execute(
             "UPDATE users SET password_hash = ?, salt = ?,"
             " must_change_password = 0 WHERE id = ?",
             (hash_password(body.new_password, salt), salt, user["id"]),
         )
+        if current_token:
+            conn.execute(
+                "DELETE FROM sessions WHERE user_id = ? AND token != ?",
+                (user["id"], current_token),
+            )
+        # 取不到当前令牌时不删任何会话，避免把自己踢下线。
     return {"ok": True}
 
 
@@ -578,6 +605,12 @@ def site_stats(
             " ORDER BY count DESC, referrer_domain ASC LIMIT 10",
             (site_pk, start, end),
         ).fetchall()
+        # 活跃页面数按全量路径去重（热门页只返回 10 条，不能拿它当总数）。
+        active_pages = conn.execute(
+            "SELECT COUNT(DISTINCT page_path) AS c FROM pageviews"
+            " WHERE site_id = ? AND view_date BETWEEN ? AND ?",
+            (site_pk, start, end),
+        ).fetchone()["c"]
 
     by_date = {row["view_date"]: row for row in trend_rows}
     trend = []
@@ -600,6 +633,7 @@ def site_stats(
             "end_date": end,
         },
         "totals": {"pv": totals["pv"], "uv": totals["uv"]},
+        "active_pages": active_pages,
         "trend": trend,
         "top_pages": [
             {"path": row["page_path"], "count": row["count"]} for row in top_pages
@@ -615,9 +649,20 @@ def site_stats(
 # collection + tracker script
 # ---------------------------------------------------------------------------
 
+@app.options("/api/collect")
+def collect_options():
+    return PlainTextResponse("", status_code=204, headers=COLLECT_CORS)
+
+
 @app.post("/api/collect", status_code=201)
 async def collect(request: Request):
+    # 请求体 64KB 上限：先看 Content-Length 快速拒绝，再按实际长度复核。
+    content_length = request.headers.get("content-length", "")
+    if content_length.isdigit() and int(content_length) > MAX_COLLECT_BODY:
+        raise HTTPException(status_code=400, detail="请求体过大")
     raw_body = await request.body()
+    if len(raw_body) > MAX_COLLECT_BODY:
+        raise HTTPException(status_code=400, detail="请求体过大")
     if raw_body:
         try:
             data = json.loads(raw_body.decode("utf-8"))
@@ -649,7 +694,11 @@ async def collect(request: Request):
     page_path = parse_page_path(raw_url)
 
     if payload.get("referrer_domain"):
-        referrer_domain = normalize_host(str(payload["referrer_domain"]))
+        candidate = normalize_host(str(payload["referrer_domain"]))
+        if len(candidate) > MAX_DOMAIN_LENGTH or not HOST_RE.match(candidate):
+            referrer_domain = ""
+        else:
+            referrer_domain = candidate
     else:
         referrer_value = (
             payload.get("referrer")
@@ -659,12 +708,10 @@ async def collect(request: Request):
             or ""
         )
         referrer_domain = domain_from_value(str(referrer_value))
-    user_agent = str(
-        payload.get("user_agent")
-        or payload.get("userAgent")
-        or request.headers.get("user-agent")
-        or ""
-    )
+        if len(referrer_domain) > MAX_DOMAIN_LENGTH:
+            referrer_domain = ""
+    # UA 分类只认请求头：正文里的 user_agent/userAgent 可被伪造，不再采信。
+    user_agent = request.headers.get("user-agent") or ""
     ua_class = classify_user_agent(user_agent)
     now = utcnow()
     view_date = now.date().isoformat()
@@ -695,12 +742,16 @@ async def collect(request: Request):
             ),
         )
         pageview_id = cur.lastrowid
-    return {
-        "ok": True,
-        "site_id": public_id,
-        "pageview_id": pageview_id,
-        "page_path": page_path,
-    }
+    return JSONResponse(
+        {
+            "ok": True,
+            "site_id": public_id,
+            "pageview_id": pageview_id,
+            "page_path": page_path,
+        },
+        status_code=201,
+        headers=COLLECT_CORS,
+    )
 
 
 TRACKER_JS = """(function () {
@@ -735,7 +786,10 @@ def tracker_js():
     return PlainTextResponse(
         TRACKER_JS,
         media_type="application/javascript",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "Access-Control-Allow-Origin": "*",
+        },
     )
 
 
@@ -753,5 +807,7 @@ init_db()
 if __name__ == "__main__":
     import uvicorn
 
+    # 口径#3：默认只监听本机；对外放开走 WEBLENS_HOST 环境变量。
+    host = os.environ.get("WEBLENS_HOST", "127.0.0.1")
     port = int(os.environ.get("WEBLENS_PORT", os.environ.get("PORT", "8000")))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host=host, port=port)

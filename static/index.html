@@ -195,9 +195,9 @@
     <h1>看清每一次访问</h1>
     <p>登录后管理站点、复制埋点脚本，并查看访问量、访客与来源趋势。</p>
     <label for="username">账号</label>
-    <input id="username" autocomplete="username" value="admin" required>
+    <input id="username" autocomplete="username" required>
     <label for="password">密码</label>
-    <input id="password" type="password" autocomplete="current-password" value="admin123" required>
+    <input id="password" type="password" autocomplete="current-password" required>
     <div id="loginError" class="error"></div>
     <button class="btn primary wide" type="submit">进入观测台</button>
     <div class="hint">默认账号 admin / admin123，首次登录后请修改密码。</div>
@@ -504,7 +504,8 @@ async function loadStats() {
   $('totalUv').textContent = stats.totals.uv;
   $('pagesPerVisitor').textContent = stats.totals.uv
     ? (stats.totals.pv / stats.totals.uv).toFixed(1) : '0';
-  $('activePages').textContent = stats.top_pages.length;
+  $('activePages').textContent = stats.active_pages != null
+    ? stats.active_pages : stats.top_pages.length;
   $('periodText').textContent = `${stats.period.start_date} 至 ${stats.period.end_date}`;
   renderTrend(stats.trend);
   renderRank('topPages', stats.top_pages, 'path');
