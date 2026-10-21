@@ -578,6 +578,11 @@ def site_stats(
             " ORDER BY count DESC, referrer_domain ASC LIMIT 10",
             (site_pk, start, end),
         ).fetchall()
+        active_pages = conn.execute(
+            "SELECT COUNT(DISTINCT page_path) AS c FROM pageviews"
+            " WHERE site_id = ? AND view_date BETWEEN ? AND ?",
+            (site_pk, start, end),
+        ).fetchone()["c"]
 
     by_date = {row["view_date"]: row for row in trend_rows}
     trend = []
@@ -600,6 +605,7 @@ def site_stats(
             "end_date": end,
         },
         "totals": {"pv": totals["pv"], "uv": totals["uv"]},
+        "active_pages": active_pages,
         "trend": trend,
         "top_pages": [
             {"path": row["page_path"], "count": row["count"]} for row in top_pages
@@ -649,7 +655,7 @@ async def collect(request: Request):
     page_path = parse_page_path(raw_url)
 
     if payload.get("referrer_domain"):
-        referrer_domain = normalize_host(str(payload["referrer_domain"]))
+        referrer_domain = domain_from_value(str(payload["referrer_domain"]))
     else:
         referrer_value = (
             payload.get("referrer")
@@ -659,12 +665,9 @@ async def collect(request: Request):
             or ""
         )
         referrer_domain = domain_from_value(str(referrer_value))
-    user_agent = str(
-        payload.get("user_agent")
-        or payload.get("userAgent")
-        or request.headers.get("user-agent")
-        or ""
-    )
+    if len(referrer_domain) > MAX_DOMAIN_LENGTH:
+        referrer_domain = ""
+    user_agent = request.headers.get("user-agent") or ""
     ua_class = classify_user_agent(user_agent)
     now = utcnow()
     view_date = now.date().isoformat()
@@ -754,4 +757,4 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("WEBLENS_PORT", os.environ.get("PORT", "8000")))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="127.0.0.1", port=port)

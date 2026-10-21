@@ -504,7 +504,8 @@ async function loadStats() {
   $('totalUv').textContent = stats.totals.uv;
   $('pagesPerVisitor').textContent = stats.totals.uv
     ? (stats.totals.pv / stats.totals.uv).toFixed(1) : '0';
-  $('activePages').textContent = stats.top_pages.length;
+  $('activePages').textContent = stats.active_pages != null
+    ? stats.active_pages : stats.top_pages.length;
   $('periodText').textContent = `${stats.period.start_date} 至 ${stats.period.end_date}`;
   renderTrend(stats.trend);
   renderRank('topPages', stats.top_pages, 'path');
