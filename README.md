@@ -46,15 +46,15 @@ python app.py
 |---|---|---|
 | `WEBLENS_HOST` | 监听地址；默认只监听本机 | `127.0.0.1` |
 | `WEBLENS_PORT` | 监听端口（未设置时再看 `PORT`） | `8000` |
-| `WEBLENS_DB_PATH` | SQLite 数据库文件位置 | `data/weblens.db` |
+| `WEBLENS_DB_PATH` | SQLite 数据库文件位置（相对 `app.py` 所在目录） | `data/weblens.db` |
 | `WL_INITIAL_USERNAME` / `WL_INITIAL_PASSWORD` | 首次启动创建的初始账号 | `admin` / `admin123` |
-| `WEBLENS_UV_SALT` | UV 哈希盐；不设置时首次启动在本机数据库中生成 | 无 |
+| `WEBLENS_UV_SALT` | UV 哈希盐；不设置时首次上报计算 UV 时写入本机数据库 | 无 |
 
 > 需要局域网或对外访问时，把 `WEBLENS_HOST` 改成 `0.0.0.0`；放开前请先改掉默认密码。
 
 ## 接入一个网站
 
-1. 登录 weblens，新建站点并填写名称与域名。
+1. 登录 weblens，新建站点并填写名称与域名。域名可填 `example.com`，也可粘贴完整地址，系统会自动去掉协议、路径和开头的 `www.`，只保留主机名。
 2. 在站点详情中复制埋点脚本。
 3. 把脚本粘贴到目标网站每个页面的 `</body>` 前，或放进网站的公共模板。
 4. 打开目标网页后回到 weblens，选择时间范围即可查看统计。
@@ -81,7 +81,8 @@ python app.py
 - `url` 可传完整 URL 或页面路径，入库时只保留路径部分。
 - `referrer` 可传完整来源 URL，入库时只保留站外来源域名。
 - User-Agent 从请求头读取并只保存浏览器、系统、设备三类粗分类。
-- 请求体超过 64KB 时返回 400。
+- 埋点脚本会顺带上报页面标题（`title` 字段），服务端目前不入库，仅保留页面路径。
+- 请求体在 64KiB 到 128KiB 之间时返回 400「请求体过大」；超过 128KiB 时由框架直接返回 413。
 
 ## 测试
 
@@ -103,7 +104,7 @@ python -m pytest tests/ -q
 python tests/live_selftest.py
 ```
 
-`live_selftest.py` 会在临时数据库上真的启动一个 Uvicorn 服务，走完建站、埋点上报、统计断言、改名与删除流程。当前自动化测试 30 项（其中 6 项为 UA 分类的参数化用例）、真实流程自测 15 个检查点，均已在干净虚拟环境中按钉死依赖版本复验通过。
+`live_selftest.py` 会在临时数据库上真的启动一个 Uvicorn 服务，走完建站、埋点上报、统计断言、改名与删除流程。当前自动化测试 36 项（其中 6 项为 UA 分类的参数化用例）、真实流程自测 15 个检查点，均已在干净虚拟环境中按钉死依赖版本复验通过。
 
 ## 项目结构
 
@@ -115,7 +116,8 @@ python tests/live_selftest.py
 - `UPSTREAM.md` — 上游溯源信息
 - `DECISIONS.md` — 本仓决定记录（用户决策与复核结论）
 - `LICENSE` — MIT 许可证文本
-- `requirements.txt` / `requirements-dev.txt` — 钉死版本的运行/测试依赖
+- `requirements.txt` / `requirements-dev.txt` — 运行/测试的直接依赖，版本已钉死
+- `.gitignore` — 忽略本地数据库、虚拟环境等不入库文件
 
 ## 许可证
 

@@ -124,3 +124,39 @@ MAX_REQUEST_BODY 128KiB 上限、TASK-058 的 IPv6 兜底，无回退无重复�
 - 审查结论：无"强制改密"回潮（口径#1，报告主动引用 D-1/D-2/D-3/D-6/D-8）；
   /docs 三入口 404 关闭；WEBLENS_HOST 口径一致；改密吊销留本次一致；
   P2-7（X-Forwarded-For）/P2-8（访客哈希）维持 D-6/D-8 不改。
+
+## D-11 TASK-071/073/068 三合一收口决定（2026-10-22）
+
+三分支测试文件均未动、无"强制改密"回潮，均在 main（91e08ef）上手工处理；
+tests/ 只新增、未改动已有断言（红线）。
+
+- **TASK-071（review+fix，基座即 main head，直接搬运）**：采纳 P1-1——新增
+  `is_utf8_text()` 守卫，5 处（hash_password/登录用户名/validate_site_name/
+  parse_page_path/domain_from_value）与 review 处方逐字对应；孤立代理字符
+  不再抛未捕获的 UnicodeEncodeError（500）。配回归测试
+  `test_surrogate_unicode_400_not_500`（登录用户名/密码 400、站点名 400、
+  上报 URL 400、referrer 记空串照常 201；已验证守卫失效时该测试失败）。
+  P2 采纳 P2-1（README 测试数→36）、P2-2（400/413 分界）、P2-3（库路径相对
+  app.py）、P2-4（域名规范化说明）；P2-5 不做（禁改测试文件）；P2-6（埋点
+  脚本地址取请求 Host）评估后维持现状——Host 拼地址是零配置反代场景需要的，
+  片段不落库且默认只监听本机，风险低优暂不改；P2-8 按事实错误关闭（"仓库根
+  没有 .gitignore"不实，main 早有）；P2-7/P2-9/P2-10 按 D-6/D-8 关闭。
+- **TASK-073（纯 review，基座即 main）**：采纳 P2-1~P2-4（测试数、400/413、
+  UV 盐"首次上报计算 UV 时写入 settings"、结构清单补 .gitignore）与 P2-7
+  （字体名 ui-sans-system→ui-sans-serif，与 068 同项只做一次）；**P2-5 按
+  口径#8 升级采纳**：登录与改密验旧密码两处 `!=` 比对口令哈希改为
+  `secrets.compare_digest`（令牌校验走 DB 参数化查询，不算字面比对，无需改；
+  断言结果不变，属非弱化改写）；P2-6（登录/上报限流）不采纳，属新增行为，
+  暂缓。
+- **TASK-068（纯 review，基座旧 3 commit，P2-1 数字已过时按 main 现状 36 项
+  处理）**：采纳 P2-1~P2-7（P2-3 取"README 注明 title 字段不入库"的文档方案，
+  不动埋点脚本；P2-4 改"直接依赖钉死版本"措辞，不碰 requirements.txt 版本号）；
+  采纳 **P2-8**：安全响应头中间件移到请求体上限中间件之外，413 也带
+  X-Frame-Options/X-Content-Type-Options，附断言测试
+  `test_413_response_has_security_headers`（实测确认原顺序下 413 无头）；
+  采纳 **P2-9**：登录响应与看板页加 `Cache-Control: no-store`，附断言测试
+  `test_login_and_dashboard_no_store`；P2-10（登录失败限速）不采纳，属新增
+  行为且会碰现有测试断言，关闭。
+- 环境备忘：本仓 starlette 1.9.0 下实测"后挂载的中间件在外层"（与直觉的
+  reversed 堆叠相反，以实测为准）；413 响应体为固定文本 `Content Too Large`，
+  非用户数据，带安全头无回显风险。
