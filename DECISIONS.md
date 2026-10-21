@@ -88,3 +88,22 @@ try/except，无范围外改动；测试文件未动。
 - 审查结论：无"强制改密"回潮（口径#1，分支报告已决事项节亦逐条引用关闭）；
   改密吊销仍是"删其他留本次"（口径#2）；host 仍是 WEBLENS_HOST 口径（口径#3）；
   SSRF 不适用（口径#9）。
+
+## D-9 TASK-061-weblens 收口决定（2026-10-21）
+
+该分支基座落后 main 1 个 commit（ed44961 vs 9bed740，main 侧只加了文档），
+未整支合并，只手工搬运；搬运版与分支版逐行比对零功能差异（仅注释措辞不同）。
+
+- 采纳 P1-1：会话令牌改 SHA-256 哈希入库。新增 `session_key()`（令牌熵足够，
+  不加盐），登录写入、鉴权校验、登出删除、改密吊销四处统一走哈希；接口返回
+  给客户端的仍是原始令牌。**副作用：此前明文入库的旧会话全部失效，需重新
+  登录**（dailymemo/quicklink/startdeck 之前同类改造亦如此）。配回归测试
+  `test_session_token_stored_hashed_not_plaintext`（入库非明文＋原始令牌可用＋
+  登出后 401）。
+- 采纳 P1-2：未认证接口请求体硬上限。`RequestBodyLimitMiddleware`
+ （`MAX_REQUEST_BODY = 128 * 1024`）挂在安全响应头中间件之外；`/api/collect`
+  原有的 64KB→400 逻辑保留（70KB 上报仍 400"请求体过大"，140KB 登录正文
+  413）。已在钉死依赖的干净环境验证 `starlette.middleware.body_limit` 可用
+  （starlette 1.9.0）。配回归测试 `test_request_body_hard_limit_413`。
+- P2 九条不动（Grok 自己标不修；P2-4/P2-7 按 D-6 关闭）。
+- 审查结论：分支未动测试文件；无口径冲突。
