@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+import time
 import tempfile
 import uuid
 
@@ -582,3 +583,19 @@ def test_login_and_dashboard_no_store(client):
     res = client.get("/")
     assert res.status_code == 200
     assert res.headers.get("cache-control") == "no-store"
+
+
+def test_login_unknown_user_runs_dummy_pbkdf2(client):
+    # TASK-086 回归：不存在的用户名登录也要跑一遍 PBKDF2（哑盐）再 401，
+    # 否则"用户不存在"和"密码错误"的响应时间差几十毫秒，可被用来枚举用户名。
+    # PBKDF2 20 万次迭代实测约 110ms；阈值取 50ms，只防"完全没跑"的退化，
+    # 留足机器差异余量。
+    start = time.perf_counter()
+    res = client.post(
+        "/api/login",
+        json={"username": "no_such_user_xyz", "password": "whatever123"},
+    )
+    elapsed = time.perf_counter() - start
+    assert res.status_code == 401
+    assert res.json()["detail"] == "用户名或密码不正确"
+    assert elapsed > 0.05, f"哑盐 PBKDF2 似乎没跑，仅用了 {elapsed:.3f}s"
