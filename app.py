@@ -67,13 +67,17 @@ def normalize_domain_input(value: str) -> str:
     raw = (value or "").strip()
     if not raw or len(raw) > MAX_URL_LENGTH or any(ch.isspace() for ch in raw):
         raise HTTPException(status_code=400, detail="域名为空、过长或包含空白")
-    if "://" in raw:
-        parsed = urllib.parse.urlparse(raw)
-        if parsed.scheme not in ("http", "https"):
-            raise HTTPException(status_code=400, detail="域名只支持 http/https 地址")
-        host = parsed.hostname or ""
-    else:
-        host = urllib.parse.urlparse("//" + raw).hostname or ""
+    try:
+        # urlparse 对畸形 IPv6（如 http://[）抛 ValueError，这里要变成 400。
+        if "://" in raw:
+            parsed = urllib.parse.urlparse(raw)
+            if parsed.scheme not in ("http", "https"):
+                raise HTTPException(status_code=400, detail="域名只支持 http/https 地址")
+            host = parsed.hostname or ""
+        else:
+            host = urllib.parse.urlparse("//" + raw).hostname or ""
+    except (ValueError, UnicodeError):
+        raise HTTPException(status_code=400, detail="域名格式不正确")
     host = normalize_host(host)
     if not host or len(host) > MAX_DOMAIN_LENGTH or not HOST_RE.match(host):
         raise HTTPException(status_code=400, detail="域名格式不正确")
@@ -84,10 +88,14 @@ def domain_from_value(value: str | None) -> str:
     raw = (value or "").strip()
     if not raw or raw.startswith("/"):
         return ""
-    if "://" in raw or raw.startswith("//"):
-        host = urllib.parse.urlparse(raw).hostname or ""
-    else:
-        host = urllib.parse.urlparse("//" + raw).hostname or ""
+    try:
+        # 公开上报的来源不合法时记空串，避免 urlparse 的 ValueError 变成 500 并丢掉这次访问。
+        if "://" in raw or raw.startswith("//"):
+            host = urllib.parse.urlparse(raw).hostname or ""
+        else:
+            host = urllib.parse.urlparse("//" + raw).hostname or ""
+    except (ValueError, UnicodeError):
+        return ""
     return normalize_host(host)
 
 
@@ -95,9 +103,13 @@ def parse_page_path(value: str) -> str:
     raw = (value or "").strip() or "/"
     if len(raw) > MAX_URL_LENGTH:
         raise HTTPException(status_code=400, detail="页面地址过长")
-    parsed = urllib.parse.urlparse(raw)
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        parsed_host = parsed.hostname
+    except (ValueError, UnicodeError):
+        raise HTTPException(status_code=400, detail="页面地址格式不正确")
     if parsed.scheme:
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        if parsed.scheme not in ("http", "https") or not parsed_host:
             raise HTTPException(status_code=400, detail="页面地址格式不正确")
     path = parsed.path or "/"
     if not path.startswith("/"):
@@ -108,9 +120,12 @@ def parse_page_path(value: str) -> str:
 
 
 def page_hostname(value: str, site_domain: str) -> str:
-    parsed = urllib.parse.urlparse(value or "")
-    if parsed.hostname:
-        return normalize_host(parsed.hostname)
+    try:
+        parsed = urllib.parse.urlparse(value or "")
+        if parsed.hostname:
+            return normalize_host(parsed.hostname)
+    except (ValueError, UnicodeError):
+        return site_domain
     return site_domain
 
 
@@ -277,10 +292,11 @@ def init_db() -> None:
                 ON pageviews(site_id, page_path);
             """
         )
-        row = conn.execute(
-            "SELECT id FROM users WHERE username = ?", (INITIAL_USERNAME,)
-        ).fetchone()
-        if row is None:
+        # 单用户设计：初始账号只在库里没有任何用户时创建一次。
+        # 换 WL_INITIAL_USERNAME 不会再追加第二个账号（旧账号依然有效，
+        # 如需停用请直接改密码或删库重建）。
+        user_count = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+        if user_count == 0:
             salt = secrets.token_hex(16)
             conn.execute(
                 "INSERT INTO users (username, password_hash, salt,"
@@ -321,6 +337,15 @@ COLLECT_CORS = {
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
 }
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    # 防点击劫持与 MIME 嗅探；看板不设计被嵌套展示。
+    response = await call_next(request)
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 class LoginIn(BaseModel):
