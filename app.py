@@ -1,0 +1,757 @@
+"""weblens: a lightweight self-hosted website analytics tool.
+
+Create a site, copy one small tracking script into its pages, and read
+pageview / unique-visitor totals, daily trends, popular pages and
+referrer domains from a single dashboard. Single-file FastAPI backend +
+SQLite + one static page. Design notes live in NOTES.md.
+"""
+import hashlib
+import json
+import os
+import re
+import secrets
+import sqlite3
+import time
+import urllib.parse
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, PlainTextResponse
+from pydantic import BaseModel
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = os.environ.get("WEBLENS_DB_PATH", str(BASE_DIR / "data" / "weblens.db"))
+TOKEN_TTL_SECONDS = 24 * 60 * 60
+INITIAL_USERNAME = os.environ.get("WL_INITIAL_USERNAME", "admin")
+INITIAL_PASSWORD = os.environ.get("WL_INITIAL_PASSWORD", "admin123")
+MAX_SITE_NAME = 80
+MAX_DOMAIN_LENGTH = 253
+MAX_PAGE_PATH = 1000
+MAX_URL_LENGTH = 2048
+HOST_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
+)
+
+
+# ---------------------------------------------------------------------------
+# small utilities
+# ---------------------------------------------------------------------------
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso(dt: datetime) -> str:
+    return dt.isoformat(timespec="seconds")
+
+
+def hash_password(password: str, salt_hex: str) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), 200_000
+    ).hex()
+
+
+def normalize_host(host: str) -> str:
+    host = (host or "").strip().lower().rstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def normalize_domain_input(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw or len(raw) > MAX_URL_LENGTH or any(ch.isspace() for ch in raw):
+        raise HTTPException(status_code=400, detail="域名为空、过长或包含空白")
+    if "://" in raw:
+        parsed = urllib.parse.urlparse(raw)
+        if parsed.scheme not in ("http", "https"):
+            raise HTTPException(status_code=400, detail="域名只支持 http/https 地址")
+        host = parsed.hostname or ""
+    else:
+        host = urllib.parse.urlparse("//" + raw).hostname or ""
+    host = normalize_host(host)
+    if not host or len(host) > MAX_DOMAIN_LENGTH or not HOST_RE.match(host):
+        raise HTTPException(status_code=400, detail="域名格式不正确")
+    return host
+
+
+def domain_from_value(value: str | None) -> str:
+    raw = (value or "").strip()
+    if not raw or raw.startswith("/"):
+        return ""
+    if "://" in raw or raw.startswith("//"):
+        host = urllib.parse.urlparse(raw).hostname or ""
+    else:
+        host = urllib.parse.urlparse("//" + raw).hostname or ""
+    return normalize_host(host)
+
+
+def parse_page_path(value: str) -> str:
+    raw = (value or "").strip() or "/"
+    if len(raw) > MAX_URL_LENGTH:
+        raise HTTPException(status_code=400, detail="页面地址过长")
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme:
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise HTTPException(status_code=400, detail="页面地址格式不正确")
+    path = parsed.path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    if len(path) > MAX_PAGE_PATH or any(ord(ch) < 32 for ch in path):
+        raise HTTPException(status_code=400, detail="页面路径不合法")
+    return path
+
+
+def page_hostname(value: str, site_domain: str) -> str:
+    parsed = urllib.parse.urlparse(value or "")
+    if parsed.hostname:
+        return normalize_host(parsed.hostname)
+    return site_domain
+
+
+def classify_user_agent(user_agent: str | None) -> dict:
+    ua = user_agent or ""
+    low = ua.lower()
+    bot_tokens = (
+        "bot", "spider", "crawler", "curl/", "wget/", "python-requests",
+        "postmanruntime", "headlesschrome",
+    )
+    is_bot = any(token in low for token in bot_tokens)
+
+    if is_bot:
+        browser = "机器人"
+    elif "edg/" in low or "edga/" in low or "edgios/" in low:
+        browser = "Edge"
+    elif "opr/" in low or "opera" in low:
+        browser = "Opera"
+    elif "samsungbrowser/" in low:
+        browser = "Samsung Internet"
+    elif "firefox/" in low:
+        browser = "Firefox"
+    elif "crios/" in low or "chrome/" in low or "chromium/" in low:
+        browser = "Chrome"
+    elif "safari/" in low:
+        browser = "Safari"
+    elif "trident/" in low or "msie" in low:
+        browser = "Internet Explorer"
+    else:
+        browser = "其他"
+
+    if "windows" in low:
+        os_name = "Windows"
+    elif "android" in low:
+        os_name = "Android"
+    elif "iphone" in low or "ipad" in low or "ipod" in low:
+        os_name = "iOS"
+    elif "cros" in low:
+        os_name = "ChromeOS"
+    elif "mac os x" in low or "macintosh" in low:
+        os_name = "macOS"
+    elif "linux" in low:
+        os_name = "Linux"
+    else:
+        os_name = "其他"
+
+    if is_bot:
+        device = "机器人"
+    elif "ipad" in low or "tablet" in low:
+        device = "平板"
+    elif (
+        "mobile" in low or "iphone" in low or "ipod" in low
+        or "windows phone" in low
+    ):
+        device = "移动设备"
+    else:
+        device = "桌面"
+    return {"browser": browser, "os": os_name, "device": device}
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip() or "unknown"
+    real_ip = request.headers.get("x-real-ip", "")
+    if real_ip:
+        return real_ip.strip()
+    return request.client.host if request.client else "unknown"
+
+
+# ---------------------------------------------------------------------------
+# database
+# ---------------------------------------------------------------------------
+
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def get_uv_salt(conn: sqlite3.Connection) -> str:
+    env_salt = os.environ.get("WEBLENS_UV_SALT", "").strip()
+    if env_salt:
+        return env_salt
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = 'uv_salt'"
+    ).fetchone()
+    if row is not None:
+        return row["value"]
+    salt = secrets.token_hex(32)
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('uv_salt', ?)", (salt,)
+    )
+    return salt
+
+
+def visitor_hash(
+    conn: sqlite3.Connection, ip: str, ua_class: dict, view_date: str
+) -> str:
+    salt = get_uv_salt(conn)
+    material = "\x1f".join(
+        [salt, ip, ua_class["browser"], ua_class["os"], ua_class["device"], view_date]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def init_db() -> None:
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    with get_conn() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                must_change_password INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                expires_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site_id TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                name TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pageviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+                page_path TEXT NOT NULL,
+                referrer_domain TEXT NOT NULL DEFAULT '',
+                browser TEXT NOT NULL,
+                os TEXT NOT NULL,
+                device TEXT NOT NULL,
+                visitor_hash TEXT NOT NULL,
+                view_date TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pageviews_site_date
+                ON pageviews(site_id, view_date);
+            CREATE INDEX IF NOT EXISTS idx_pageviews_site_path
+                ON pageviews(site_id, page_path);
+            """
+        )
+        row = conn.execute(
+            "SELECT id FROM users WHERE username = ?", (INITIAL_USERNAME,)
+        ).fetchone()
+        if row is None:
+            salt = secrets.token_hex(16)
+            conn.execute(
+                "INSERT INTO users (username, password_hash, salt,"
+                " must_change_password, created_at) VALUES (?, ?, ?, 1, ?)",
+                (
+                    INITIAL_USERNAME,
+                    hash_password(INITIAL_PASSWORD, salt),
+                    salt,
+                    iso(utcnow()),
+                ),
+            )
+
+
+# ---------------------------------------------------------------------------
+# app + auth
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="weblens", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class ChangePasswordIn(BaseModel):
+    old_password: str
+    new_password: str
+
+
+class SiteIn(BaseModel):
+    name: str
+    domain: str
+
+
+class SiteUpdateIn(BaseModel):
+    name: str | None = None
+    domain: str | None = None
+
+
+def current_user(request: Request) -> sqlite3.Row:
+    auth = request.headers.get("Authorization", "")
+    token = auth[len("Bearer "):].strip() if auth.startswith("Bearer ") else ""
+    if not token:
+        raise HTTPException(status_code=401, detail="未登录")
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id"
+            " WHERE s.token = ? AND s.expires_at > ?",
+            (token, time.time()),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
+    return row
+
+
+@app.post("/api/login")
+def login(body: LoginIn):
+    init_db()
+    with get_conn() as conn:
+        user = conn.execute(
+            "SELECT * FROM users WHERE username = ?", (body.username.strip(),)
+        ).fetchone()
+        if user is None or hash_password(body.password, user["salt"]) != user["password_hash"]:
+            raise HTTPException(status_code=401, detail="用户名或密码不正确")
+        token = secrets.token_urlsafe(32)
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)",
+            (token, user["id"], time.time() + TOKEN_TTL_SECONDS),
+        )
+    return {
+        "token": token,
+        "username": user["username"],
+        "must_change_password": bool(user["must_change_password"]),
+    }
+
+
+@app.post("/api/logout")
+def logout(request: Request, user: sqlite3.Row = Depends(current_user)):
+    token = request.headers.get("Authorization", "")[len("Bearer "):].strip()
+    with get_conn() as conn:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    return {"ok": True}
+
+
+@app.post("/api/change-password")
+def change_password(body: ChangePasswordIn, user: sqlite3.Row = Depends(current_user)):
+    if len(body.new_password) < 6:
+        raise HTTPException(status_code=400, detail="新密码至少 6 位")
+    if hash_password(body.old_password, user["salt"]) != user["password_hash"]:
+        raise HTTPException(status_code=400, detail="旧密码不正确")
+    salt = secrets.token_hex(16)
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET password_hash = ?, salt = ?,"
+            " must_change_password = 0 WHERE id = ?",
+            (hash_password(body.new_password, salt), salt, user["id"]),
+        )
+    return {"ok": True}
+
+
+@app.get("/api/me")
+def me(user: sqlite3.Row = Depends(current_user)):
+    return {
+        "username": user["username"],
+        "must_change_password": bool(user["must_change_password"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# sites
+# ---------------------------------------------------------------------------
+
+def validate_site_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name or len(name) > MAX_SITE_NAME:
+        raise HTTPException(status_code=400, detail="站点名称为空或过长")
+    return name
+
+
+def get_site_row(site_pk: int, user_id: int) -> sqlite3.Row:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM sites WHERE id = ? AND user_id = ?",
+            (site_pk, user_id),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="站点不存在")
+    return row
+
+
+def tracking_snippet(request: Request, row: sqlite3.Row) -> tuple[str, str]:
+    base = str(request.base_url).rstrip("/")
+    script_url = f"{base}/tracker.js"
+    snippet = (
+        f'<script defer src="{script_url}" '
+        f'data-weblens-id="{row["site_id"]}"></script>'
+    )
+    return script_url, snippet
+
+
+def site_json(
+    row: sqlite3.Row,
+    request: Request | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    data = {
+        "id": row["id"],
+        "site_id": row["site_id"],
+        "name": row["name"],
+        "domain": row["domain"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+    if conn is not None:
+        count = conn.execute(
+            "SELECT COUNT(*) AS c FROM pageviews WHERE site_id = ?", (row["id"],)
+        ).fetchone()
+        data["pageviews"] = count["c"]
+    if request is not None:
+        script_url, snippet = tracking_snippet(request, row)
+        data["script_url"] = script_url
+        data["snippet"] = snippet
+    return data
+
+
+@app.get("/api/sites")
+def list_sites(request: Request, user: sqlite3.Row = Depends(current_user)):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM sites WHERE user_id = ? ORDER BY id", (user["id"],)
+        ).fetchall()
+        return [site_json(r, request, conn) for r in rows]
+
+
+@app.post("/api/sites")
+def create_site(
+    body: SiteIn, request: Request, user: sqlite3.Row = Depends(current_user)
+):
+    name = validate_site_name(body.name)
+    domain = normalize_domain_input(body.domain)
+    now = iso(utcnow())
+    public_id = str(uuid.uuid4())
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO sites (site_id, user_id, name, domain, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (public_id, user["id"], name, domain, now, now),
+        )
+        row = conn.execute(
+            "SELECT * FROM sites WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+        return site_json(row, request, conn)
+
+
+@app.get("/api/sites/{site_pk}")
+def get_site(
+    site_pk: int, request: Request, user: sqlite3.Row = Depends(current_user)
+):
+    row = get_site_row(site_pk, user["id"])
+    with get_conn() as conn:
+        return site_json(row, request, conn)
+
+
+@app.get("/api/sites/{site_pk}/snippet")
+def get_snippet(
+    site_pk: int, request: Request, user: sqlite3.Row = Depends(current_user)
+):
+    row = get_site_row(site_pk, user["id"])
+    script_url, snippet = tracking_snippet(request, row)
+    return {"site_id": row["site_id"], "script_url": script_url, "snippet": snippet}
+
+
+@app.put("/api/sites/{site_pk}")
+def update_site(
+    site_pk: int,
+    body: SiteUpdateIn,
+    request: Request,
+    user: sqlite3.Row = Depends(current_user),
+):
+    get_site_row(site_pk, user["id"])
+    fields: dict = {}
+    if body.name is not None:
+        fields["name"] = validate_site_name(body.name)
+    if body.domain is not None:
+        fields["domain"] = normalize_domain_input(body.domain)
+    if fields:
+        fields["updated_at"] = iso(utcnow())
+        sets = ", ".join(f"{key} = ?" for key in fields)
+        with get_conn() as conn:
+            conn.execute(
+                f"UPDATE sites SET {sets} WHERE id = ?",
+                (*fields.values(), site_pk),
+            )
+    row = get_site_row(site_pk, user["id"])
+    with get_conn() as conn:
+        return site_json(row, request, conn)
+
+
+@app.delete("/api/sites/{site_pk}")
+def delete_site(site_pk: int, user: sqlite3.Row = Depends(current_user)):
+    get_site_row(site_pk, user["id"])
+    with get_conn() as conn:
+        conn.execute("DELETE FROM sites WHERE id = ?", (site_pk,))
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# statistics
+# ---------------------------------------------------------------------------
+
+@app.get("/api/sites/{site_pk}/stats")
+def site_stats(
+    site_pk: int,
+    range_value: str = Query(default="7d", alias="range"),
+    user: sqlite3.Row = Depends(current_user),
+):
+    site = get_site_row(site_pk, user["id"])
+    ranges = {"today": 1, "7d": 7, "30d": 30}
+    if range_value not in ranges:
+        raise HTTPException(status_code=400, detail="时间范围只支持 today、7d、30d")
+    day_count = ranges[range_value]
+    end_date = utcnow().date()
+    start_date = end_date - timedelta(days=day_count - 1)
+    start = start_date.isoformat()
+    end = end_date.isoformat()
+
+    with get_conn() as conn:
+        totals = conn.execute(
+            "SELECT COUNT(*) AS pv, COUNT(DISTINCT visitor_hash) AS uv"
+            " FROM pageviews WHERE site_id = ? AND view_date BETWEEN ? AND ?",
+            (site_pk, start, end),
+        ).fetchone()
+        trend_rows = conn.execute(
+            "SELECT view_date, COUNT(*) AS pv,"
+            " COUNT(DISTINCT visitor_hash) AS uv FROM pageviews"
+            " WHERE site_id = ? AND view_date BETWEEN ? AND ?"
+            " GROUP BY view_date",
+            (site_pk, start, end),
+        ).fetchall()
+        top_pages = conn.execute(
+            "SELECT page_path, COUNT(*) AS count FROM pageviews"
+            " WHERE site_id = ? AND view_date BETWEEN ? AND ?"
+            " GROUP BY page_path ORDER BY count DESC, page_path ASC LIMIT 10",
+            (site_pk, start, end),
+        ).fetchall()
+        top_referrers = conn.execute(
+            "SELECT referrer_domain, COUNT(*) AS count FROM pageviews"
+            " WHERE site_id = ? AND view_date BETWEEN ? AND ?"
+            " AND referrer_domain <> ''"
+            " GROUP BY referrer_domain"
+            " ORDER BY count DESC, referrer_domain ASC LIMIT 10",
+            (site_pk, start, end),
+        ).fetchall()
+
+    by_date = {row["view_date"]: row for row in trend_rows}
+    trend = []
+    for offset in range(day_count):
+        day = start_date + timedelta(days=offset)
+        key = day.isoformat()
+        row = by_date.get(key)
+        trend.append(
+            {
+                "date": key,
+                "pv": row["pv"] if row else 0,
+                "uv": row["uv"] if row else 0,
+            }
+        )
+    return {
+        "site": site_json(site),
+        "period": {
+            "range": range_value,
+            "start_date": start,
+            "end_date": end,
+        },
+        "totals": {"pv": totals["pv"], "uv": totals["uv"]},
+        "trend": trend,
+        "top_pages": [
+            {"path": row["page_path"], "count": row["count"]} for row in top_pages
+        ],
+        "top_referrers": [
+            {"domain": row["referrer_domain"], "count": row["count"]}
+            for row in top_referrers
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# collection + tracker script
+# ---------------------------------------------------------------------------
+
+@app.post("/api/collect", status_code=201)
+async def collect(request: Request):
+    raw_body = await request.body()
+    if raw_body:
+        try:
+            data = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise HTTPException(status_code=400, detail="请求体不是合法 JSON")
+    else:
+        data = {}
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+    payload = data
+    if isinstance(data.get("payload"), dict):
+        payload = {**data, **data["payload"]}
+
+    public_id = str(
+        payload.get("site_id")
+        or payload.get("siteId")
+        or payload.get("website_id")
+        or ""
+    ).strip()
+    if not public_id:
+        raise HTTPException(status_code=400, detail="缺少 site_id")
+
+    raw_url = str(
+        payload.get("url")
+        or payload.get("page_url")
+        or payload.get("path")
+        or "/"
+    )
+    page_path = parse_page_path(raw_url)
+
+    if payload.get("referrer_domain"):
+        referrer_domain = normalize_host(str(payload["referrer_domain"]))
+    else:
+        referrer_value = (
+            payload.get("referrer")
+            or payload.get("referer")
+            or request.headers.get("referer")
+            or request.headers.get("referrer")
+            or ""
+        )
+        referrer_domain = domain_from_value(str(referrer_value))
+    user_agent = str(
+        payload.get("user_agent")
+        or payload.get("userAgent")
+        or request.headers.get("user-agent")
+        or ""
+    )
+    ua_class = classify_user_agent(user_agent)
+    now = utcnow()
+    view_date = now.date().isoformat()
+
+    with get_conn() as conn:
+        site = conn.execute(
+            "SELECT * FROM sites WHERE site_id = ?", (public_id,)
+        ).fetchone()
+        if site is None:
+            raise HTTPException(status_code=404, detail="站点不存在")
+        if referrer_domain in (site["domain"], page_hostname(raw_url, site["domain"])):
+            referrer_domain = ""
+        vhash = visitor_hash(conn, client_ip(request), ua_class, view_date)
+        cur = conn.execute(
+            "INSERT INTO pageviews (site_id, page_path, referrer_domain, browser,"
+            " os, device, visitor_hash, view_date, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                site["id"],
+                page_path,
+                referrer_domain,
+                ua_class["browser"],
+                ua_class["os"],
+                ua_class["device"],
+                vhash,
+                view_date,
+                iso(now),
+            ),
+        )
+        pageview_id = cur.lastrowid
+    return {
+        "ok": True,
+        "site_id": public_id,
+        "pageview_id": pageview_id,
+        "page_path": page_path,
+    }
+
+
+TRACKER_JS = """(function () {
+  var script = document.currentScript;
+  if (!script) return;
+  var siteId = script.getAttribute('data-weblens-id');
+  if (!siteId) return;
+  var endpoint = new URL('/api/collect', script.src).href;
+  var body = JSON.stringify({
+    site_id: siteId,
+    url: window.location.href,
+    referrer: document.referrer || '',
+    title: document.title || ''
+  });
+  if (navigator.sendBeacon) {
+    var blob = new Blob([body], { type: 'text/plain;charset=UTF-8' });
+    if (navigator.sendBeacon(endpoint, blob)) return;
+  }
+  fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+    body: body,
+    keepalive: true,
+    mode: 'cors'
+  }).catch(function () {});
+})();
+"""
+
+
+@app.get("/tracker.js")
+def tracker_js():
+    return PlainTextResponse(
+        TRACKER_JS,
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# static page
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+def index():
+    return FileResponse(BASE_DIR / "static" / "index.html")
+
+
+init_db()
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("WEBLENS_PORT", os.environ.get("PORT", "8000")))
+    uvicorn.run(app, host="0.0.0.0", port=port)
