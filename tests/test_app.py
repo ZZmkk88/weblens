@@ -509,3 +509,76 @@ def test_delete_site_cascades_pageviews(client, auth):
     assert client.get(f"/api/sites/{site['id']}", headers=auth).status_code == 404
     rows = db_rows("SELECT * FROM pageviews WHERE site_id = ?", (site["id"],))
     assert rows == []
+
+
+def test_surrogate_unicode_400_not_500(client, auth):
+    # TASK-071 P1-1 回归：孤立代理字符（如 \ud800）不能让接口抛未捕获的
+    # UnicodeEncodeError（500）。正文里用 JSON 转义写法，服务端解析后才是代理字符。
+    # 注：必须带 Content-Type: application/json，否则框架按表单解析直接 422，
+    # 走不到业务守卫（422 同样不是 500，但测的不是本回归项）。
+    json_headers = {"Content-Type": "application/json"}
+    # 登录：用户名/密码含代理字符 → 400
+    res = client.post(
+        "/api/login",
+        content='{"username": "admin\\ud800", "password": "x"}',
+        headers=json_headers,
+    )
+    assert res.status_code == 400
+    res = client.post(
+        "/api/login",
+        content='{"username": "admin", "password": "x\\ud800"}',
+        headers=json_headers,
+    )
+    assert res.status_code == 400
+    # 建站：站点名含代理字符 → 400
+    res = client.post(
+        "/api/sites",
+        content='{"name": "站\\ud800点", "domain": "surrogate.example.com"}',
+        headers={**auth, **json_headers},
+    )
+    assert res.status_code == 400
+    # 上报：URL 含代理字符 → 400
+    # 注意：正文必须手写（单反斜杠的 \ud800 转义），走 json.dumps 会把反斜杠
+    # 再转义一次，服务端就解析不出代理字符了。
+    site = mk_site(client, auth, "代理站", "surrogate2.example.com")
+    res = client.post(
+        "/api/collect",
+        content='{"site_id": "%s", "url": "/p\\ud800"}' % site["site_id"],
+        headers=json_headers,
+    )
+    assert res.status_code == 400
+    # 上报：referrer 含代理字符 → 记空串照常 201（不丢这次访问）
+    res = client.post(
+        "/api/collect",
+        content='{"site_id": "%s", "url": "/ok", "referrer": "https://example\\ud800.com/"}'
+        % site["site_id"],
+        headers=json_headers,
+    )
+    assert res.status_code == 201, res.text
+    rows = db_rows(
+        "SELECT * FROM pageviews WHERE site_id = ? AND page_path = '/ok'",
+        (site["id"],),
+    )
+    assert len(rows) == 1
+    assert rows[0]["referrer_domain"] == ""
+
+
+def test_413_response_has_security_headers(client):
+    # TASK-068 P2-8：框架直接返回的 413 也要带安全响应头。
+    big_login = json.dumps({"username": "admin", "password": "x" * (140 * 1024)})
+    res = client.post("/api/login", content=big_login)
+    assert res.status_code == 413
+    assert res.headers.get("x-frame-options") == "DENY"
+    assert res.headers.get("x-content-type-options") == "nosniff"
+
+
+def test_login_and_dashboard_no_store(client):
+    # TASK-068 P2-9：登录响应（含会话令牌）与看板页不缓存。
+    res = client.post(
+        "/api/login", json={"username": "admin", "password": "admin123"}
+    )
+    assert res.status_code == 200
+    assert res.headers.get("cache-control") == "no-store"
+    res = client.get("/")
+    assert res.status_code == 200
+    assert res.headers.get("cache-control") == "no-store"
