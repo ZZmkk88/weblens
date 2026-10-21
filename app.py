@@ -19,8 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -32,6 +31,7 @@ MAX_SITE_NAME = 80
 MAX_DOMAIN_LENGTH = 253
 MAX_PAGE_PATH = 1000
 MAX_URL_LENGTH = 2048
+MAX_COLLECT_BODY = 64 * 1024
 HOST_RE = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
     r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
@@ -295,13 +295,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="weblens", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+# Cross-origin access is only for the public tracker. Login and the
+# dashboard stay same-origin so a random page cannot read them.
+COLLECT_CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
 
 
 class LoginIn(BaseModel):
@@ -615,9 +616,19 @@ def site_stats(
 # collection + tracker script
 # ---------------------------------------------------------------------------
 
+@app.options("/api/collect")
+def collect_options():
+    return PlainTextResponse("", status_code=204, headers=COLLECT_CORS)
+
+
 @app.post("/api/collect", status_code=201)
 async def collect(request: Request):
+    content_length = request.headers.get("content-length", "")
+    if content_length.isdigit() and int(content_length) > MAX_COLLECT_BODY:
+        raise HTTPException(status_code=400, detail="请求体过大")
     raw_body = await request.body()
+    if len(raw_body) > MAX_COLLECT_BODY:
+        raise HTTPException(status_code=400, detail="请求体过大")
     if raw_body:
         try:
             data = json.loads(raw_body.decode("utf-8"))
@@ -649,7 +660,11 @@ async def collect(request: Request):
     page_path = parse_page_path(raw_url)
 
     if payload.get("referrer_domain"):
-        referrer_domain = normalize_host(str(payload["referrer_domain"]))
+        candidate = normalize_host(str(payload["referrer_domain"]))
+        if len(candidate) > MAX_DOMAIN_LENGTH or not HOST_RE.match(candidate):
+            referrer_domain = ""
+        else:
+            referrer_domain = candidate
     else:
         referrer_value = (
             payload.get("referrer")
@@ -659,6 +674,8 @@ async def collect(request: Request):
             or ""
         )
         referrer_domain = domain_from_value(str(referrer_value))
+        if len(referrer_domain) > MAX_DOMAIN_LENGTH:
+            referrer_domain = ""
     user_agent = str(
         payload.get("user_agent")
         or payload.get("userAgent")
@@ -695,12 +712,16 @@ async def collect(request: Request):
             ),
         )
         pageview_id = cur.lastrowid
-    return {
-        "ok": True,
-        "site_id": public_id,
-        "pageview_id": pageview_id,
-        "page_path": page_path,
-    }
+    return JSONResponse(
+        {
+            "ok": True,
+            "site_id": public_id,
+            "pageview_id": pageview_id,
+            "page_path": page_path,
+        },
+        status_code=201,
+        headers=COLLECT_CORS,
+    )
 
 
 TRACKER_JS = """(function () {
@@ -735,7 +756,10 @@ def tracker_js():
     return PlainTextResponse(
         TRACKER_JS,
         media_type="application/javascript",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "Access-Control-Allow-Origin": "*",
+        },
     )
 
 
@@ -753,5 +777,6 @@ init_db()
 if __name__ == "__main__":
     import uvicorn
 
+    host = os.environ.get("WEBLENS_HOST", "127.0.0.1")
     port = int(os.environ.get("WEBLENS_PORT", os.environ.get("PORT", "8000")))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host=host, port=port)
