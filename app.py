@@ -21,6 +21,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
+from starlette.middleware.body_limit import RequestBodyLimitMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = os.environ.get("WEBLENS_DB_PATH", str(BASE_DIR / "data" / "weblens.db"))
@@ -32,6 +33,8 @@ MAX_DOMAIN_LENGTH = 253
 MAX_PAGE_PATH = 1000
 MAX_URL_LENGTH = 2048
 MAX_COLLECT_BODY = 64 * 1024
+# 128KiB 高于测试里约 72KiB 的超限样例，避免框架 413 抢走路由的 400。
+MAX_REQUEST_BODY = 128 * 1024
 HOST_RE = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
     r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
@@ -54,6 +57,11 @@ def hash_password(password: str, salt_hex: str) -> str:
     return hashlib.pbkdf2_hmac(
         "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), 200_000
     ).hex()
+
+
+def session_key(token: str) -> str:
+    # 令牌熵足够，库里只存 SHA-256，不必再加盐。
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def normalize_host(host: str) -> str:
@@ -348,6 +356,10 @@ async def security_headers(request: Request, call_next):
     return response
 
 
+# 加在安全响应头之外，分块正文在被内层中间件整段缓存前就被截断。
+app.add_middleware(RequestBodyLimitMiddleware, max_body_size=MAX_REQUEST_BODY)
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -377,7 +389,7 @@ def current_user(request: Request) -> sqlite3.Row:
         row = conn.execute(
             "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id"
             " WHERE s.token = ? AND s.expires_at > ?",
-            (token, time.time()),
+            (session_key(token), time.time()),
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
@@ -396,7 +408,7 @@ def login(body: LoginIn):
         token = secrets.token_urlsafe(32)
         conn.execute(
             "INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)",
-            (token, user["id"], time.time() + TOKEN_TTL_SECONDS),
+            (session_key(token), user["id"], time.time() + TOKEN_TTL_SECONDS),
         )
     return {
         "token": token,
@@ -409,7 +421,7 @@ def login(body: LoginIn):
 def logout(request: Request, user: sqlite3.Row = Depends(current_user)):
     token = request.headers.get("Authorization", "")[len("Bearer "):].strip()
     with get_conn() as conn:
-        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.execute("DELETE FROM sessions WHERE token = ?", (session_key(token),))
     return {"ok": True}
 
 
@@ -441,7 +453,7 @@ def change_password(
         if current_token:
             conn.execute(
                 "DELETE FROM sessions WHERE user_id = ? AND token != ?",
-                (user["id"], current_token),
+                (user["id"], session_key(current_token)),
             )
         # 取不到当前令牌时不删任何会话，避免把自己踢下线。
     return {"ok": True}
