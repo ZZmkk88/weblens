@@ -54,7 +54,19 @@ def iso(dt: datetime) -> str:
     return dt.isoformat(timespec="seconds")
 
 
+def is_utf8_text(value: str) -> bool:
+    # JSON 允许孤立代理字符进 Python str，但 SQLite / PBKDF2 的 UTF-8 编码会抛
+    # UnicodeEncodeError，公开接口上就会变成未捕获的 HTTP 500。
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def hash_password(password: str, salt_hex: str) -> str:
+    if not is_utf8_text(password):
+        raise HTTPException(status_code=400, detail="密码包含无法编码的字符")
     return hashlib.pbkdf2_hmac(
         "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), 200_000
     ).hex()
@@ -106,7 +118,10 @@ def domain_from_value(value: str | None) -> str:
             host = urllib.parse.urlparse("//" + raw).hostname or ""
     except (ValueError, UnicodeError):
         return ""
-    return normalize_host(host)
+    host = normalize_host(host)
+    if not is_utf8_text(host):
+        return ""
+    return host
 
 
 def parse_page_path(value: str) -> str:
@@ -124,7 +139,11 @@ def parse_page_path(value: str) -> str:
     path = parsed.path or "/"
     if not path.startswith("/"):
         path = "/" + path
-    if len(path) > MAX_PAGE_PATH or any(ord(ch) < 32 for ch in path):
+    if (
+        len(path) > MAX_PAGE_PATH
+        or any(ord(ch) < 32 for ch in path)
+        or not is_utf8_text(path)
+    ):
         raise HTTPException(status_code=400, detail="页面路径不合法")
     return path
 
@@ -349,17 +368,18 @@ COLLECT_CORS = {
 }
 
 
+# 先挂请求体上限：超限正文在到达业务逻辑前就被截断，直接回 413。
+app.add_middleware(RequestBodyLimitMiddleware, max_body_size=MAX_REQUEST_BODY)
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
+    # 后挂载即在最外层：所有响应（含框架直接返回的 413）都带上安全响应头。
     # 防点击劫持与 MIME 嗅探；看板不设计被嵌套展示。
     response = await call_next(request)
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response
-
-
-# 挂在安全响应头中间件之外：超限正文在到达业务逻辑前就被截断，直接回 413。
-app.add_middleware(RequestBodyLimitMiddleware, max_body_size=MAX_REQUEST_BODY)
 
 
 class LoginIn(BaseModel):
@@ -401,22 +421,32 @@ def current_user(request: Request) -> sqlite3.Row:
 @app.post("/api/login")
 def login(body: LoginIn):
     init_db()
+    username = body.username.strip()
+    if not is_utf8_text(username):
+        raise HTTPException(status_code=400, detail="用户名包含无法编码的字符")
     with get_conn() as conn:
         user = conn.execute(
-            "SELECT * FROM users WHERE username = ?", (body.username.strip(),)
+            "SELECT * FROM users WHERE username = ?", (username,)
         ).fetchone()
-        if user is None or hash_password(body.password, user["salt"]) != user["password_hash"]:
+        # 口径#8：敏感比对用 secrets.compare_digest，避免时序侧信道。
+        if user is None or not secrets.compare_digest(
+            hash_password(body.password, user["salt"]), user["password_hash"]
+        ):
             raise HTTPException(status_code=401, detail="用户名或密码不正确")
         token = secrets.token_urlsafe(32)
         conn.execute(
             "INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)",
             (session_key(token), user["id"], time.time() + TOKEN_TTL_SECONDS),
         )
-    return {
-        "token": token,
-        "username": user["username"],
-        "must_change_password": bool(user["must_change_password"]),
-    }
+    # 登录响应不缓存：里面带着本次会话令牌。
+    return JSONResponse(
+        {
+            "token": token,
+            "username": user["username"],
+            "must_change_password": bool(user["must_change_password"]),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/api/logout")
@@ -435,7 +465,10 @@ def change_password(
 ):
     if len(body.new_password) < 6:
         raise HTTPException(status_code=400, detail="新密码至少 6 位")
-    if hash_password(body.old_password, user["salt"]) != user["password_hash"]:
+    # 口径#8：敏感比对用 secrets.compare_digest，避免时序侧信道。
+    if not secrets.compare_digest(
+        hash_password(body.old_password, user["salt"]), user["password_hash"]
+    ):
         raise HTTPException(status_code=400, detail="旧密码不正确")
     # 口径#2：本次请求携带的令牌就是当前会话，改密时保留它。
     auth_header = request.headers.get("Authorization", "")
@@ -477,6 +510,8 @@ def validate_site_name(name: str) -> str:
     name = (name or "").strip()
     if not name or len(name) > MAX_SITE_NAME:
         raise HTTPException(status_code=400, detail="站点名称为空或过长")
+    if not is_utf8_text(name):
+        raise HTTPException(status_code=400, detail="站点名称包含无法编码的字符")
     return name
 
 
@@ -849,7 +884,11 @@ def tracker_js():
 
 @app.get("/")
 def index():
-    return FileResponse(BASE_DIR / "static" / "index.html")
+    # 看板页不缓存：每次打开都走最新版本，避免旧前端配新接口。
+    return FileResponse(
+        BASE_DIR / "static" / "index.html",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 init_db()
