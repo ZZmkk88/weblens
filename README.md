@@ -103,7 +103,7 @@ python -m pytest tests/ -q
 python tests/live_selftest.py
 ```
 
-`live_selftest.py` 会在临时数据库上真的启动一个 Uvicorn 服务，走完建站、埋点上报、统计断言、改名与删除流程。当前自动化测试 25 项、真实流程自测 15 个检查点，均已在干净虚拟环境中按钉死依赖版本复验通过。
+`live_selftest.py` 会在临时数据库上真的启动一个 Uvicorn 服务，走完建站、埋点上报、统计断言、改名与删除流程。当前自动化测试 30 项（其中 6 项为 UA 分类的参数化用例）、真实流程自测 15 个检查点，均已在干净虚拟环境中按钉死依赖版本复验通过。
 
 ## 项目结构
 
@@ -113,6 +113,9 @@ python tests/live_selftest.py
 - `tests/live_selftest.py` — 真实服务自测脚本
 - `NOTES.md` — 调研与设计笔记
 - `UPSTREAM.md` — 上游溯源信息
+- `DECISIONS.md` — 本仓决定记录（用户决策与复核结论）
+- `LICENSE` — MIT 许可证文本
+- `requirements.txt` / `requirements-dev.txt` — 钉死版本的运行/测试依赖
 
 ## 许可证
 

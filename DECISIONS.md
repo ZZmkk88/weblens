@@ -61,3 +61,30 @@ TASK-014 的硬编码 `127.0.0.1` 版本已按本条丢弃，改用环境变量�
 - 审查结论：分支未动测试文件；未碰登录/改密逻辑，无"强制改密"回潮（口径#1）；
   未碰 host（分支基座仍是旧的 0.0.0.0，main 已是 WEBLENS_HOST 口径#3，无需搬运）；
   weblens 无服务端对外抓取，SSRF（口径#9）不适用。
+
+## D-8 TASK-058-weblens 收口决定（2026-10-21）
+
+该分支基座落后 main 1 个 commit（91943cc vs 7a34b729，区域不重叠），未整支合并，
+只手工搬运。分支 diff 与报告声称一致：仅 app.py 四处 URL 解析函数加
+try/except，无范围外改动；测试文件未动。
+
+- 采纳 P1-1（真增量）：畸形 IPv6（如 `http://[`）此前让公开上报接口抛未捕获的
+  `ValueError`（500）并丢掉这次访问。修法：`normalize_domain_input`→400
+  "域名格式不正确"；`domain_from_value`（来源）→记空串继续入库（与现有 referrer
+  归一化"不合规则记空串"对齐）；`parse_page_path`→400；`page_hostname`→回退
+  站点域名。合法地址（含 `http://[::1]/x`）不受影响。与口径#10（超长输入明确
+  拒绝）精神一致。Grok 未带测试，已按口径#17 补回归测试
+  `test_collect_malformed_ipv6_does_not_500`（坏来源 201 且入库空串、坏页面地址
+  400、坏建站域名 400，另断言合法 IPv6 来源不受影响）。
+- 采纳 P2-5：加安全响应头中间件（`X-Frame-Options: DENY`、
+  `X-Content-Type-Options: nosniff`），参考 dailymemo TASK-040 做法；配断言测试
+  `test_security_headers_present`。
+- 采纳 P2-1/P2-4/P2-7 文档项：README 测试数 25→30（注 6 项 UA 参数化）、
+  项目结构清单补 DECISIONS.md/LICENSE/两份 requirements、新建站点弹窗注明去 www.。
+- 采纳 P2-3：`init_db` 改为库里已有任意用户时不再追加初始账号（单用户设计；
+  换 `WL_INITIAL_USERNAME` 不会再悄悄产生第二个登录账号）。
+- 不重复：P2-2（README 补 UTC）已在 7a34b729 落地。
+- 维持 D-6：P2-6（访客哈希穷举属设计取舍，不改算法）。
+- 审查结论：无"强制改密"回潮（口径#1，分支报告已决事项节亦逐条引用关闭）；
+  改密吊销仍是"删其他留本次"（口径#2）；host 仍是 WEBLENS_HOST 口径（口径#3）；
+  SSRF 不适用（口径#9）。
