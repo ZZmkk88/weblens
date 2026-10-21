@@ -54,7 +54,19 @@ def iso(dt: datetime) -> str:
     return dt.isoformat(timespec="seconds")
 
 
+def is_utf8_text(value: str) -> bool:
+    # JSON 允许孤立代理字符进 Python str，但 SQLite / PBKDF2 的 UTF-8 编码会抛
+    # UnicodeEncodeError，公开接口上就会变成未捕获的 HTTP 500。
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def hash_password(password: str, salt_hex: str) -> str:
+    if not is_utf8_text(password):
+        raise HTTPException(status_code=400, detail="密码包含无法编码的字符")
     return hashlib.pbkdf2_hmac(
         "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), 200_000
     ).hex()
@@ -106,7 +118,10 @@ def domain_from_value(value: str | None) -> str:
             host = urllib.parse.urlparse("//" + raw).hostname or ""
     except (ValueError, UnicodeError):
         return ""
-    return normalize_host(host)
+    host = normalize_host(host)
+    if not is_utf8_text(host):
+        return ""
+    return host
 
 
 def parse_page_path(value: str) -> str:
@@ -124,7 +139,11 @@ def parse_page_path(value: str) -> str:
     path = parsed.path or "/"
     if not path.startswith("/"):
         path = "/" + path
-    if len(path) > MAX_PAGE_PATH or any(ord(ch) < 32 for ch in path):
+    if (
+        len(path) > MAX_PAGE_PATH
+        or any(ord(ch) < 32 for ch in path)
+        or not is_utf8_text(path)
+    ):
         raise HTTPException(status_code=400, detail="页面路径不合法")
     return path
 
@@ -401,9 +420,12 @@ def current_user(request: Request) -> sqlite3.Row:
 @app.post("/api/login")
 def login(body: LoginIn):
     init_db()
+    username = body.username.strip()
+    if not is_utf8_text(username):
+        raise HTTPException(status_code=400, detail="用户名包含无法编码的字符")
     with get_conn() as conn:
         user = conn.execute(
-            "SELECT * FROM users WHERE username = ?", (body.username.strip(),)
+            "SELECT * FROM users WHERE username = ?", (username,)
         ).fetchone()
         if user is None or hash_password(body.password, user["salt"]) != user["password_hash"]:
             raise HTTPException(status_code=401, detail="用户名或密码不正确")
@@ -477,6 +499,8 @@ def validate_site_name(name: str) -> str:
     name = (name or "").strip()
     if not name or len(name) > MAX_SITE_NAME:
         raise HTTPException(status_code=400, detail="站点名称为空或过长")
+    if not is_utf8_text(name):
+        raise HTTPException(status_code=400, detail="站点名称包含无法编码的字符")
     return name
 
 
