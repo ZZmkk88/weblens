@@ -599,3 +599,18 @@ def test_login_unknown_user_runs_dummy_pbkdf2(client):
     assert res.status_code == 401
     assert res.json()["detail"] == "用户名或密码不正确"
     assert elapsed > 0.05, f"哑盐 PBKDF2 似乎没跑，仅用了 {elapsed:.3f}s"
+
+
+def test_db_path_resolution():
+    # TASK-102 回归：WEBLENS_DB_PATH 相对路径锚到 app.py 所在目录，
+    # 不跟进程当前目录走；空值走默认；绝对路径原样。
+    # 纯函数断言，不碰 os.environ，不影响其他用例。
+    base = str(appmod.BASE_DIR)
+    default = os.path.join(base, "data", "weblens.db")
+    assert appmod.resolve_db_path(None) == default
+    assert appmod.resolve_db_path("") == default
+    assert appmod.resolve_db_path("   ") == default
+    assert appmod.resolve_db_path("/tmp/abs.db") == "/tmp/abs.db"
+    assert appmod.resolve_db_path("rel.db") == os.path.join(base, "rel.db")
+    assert appmod.resolve_db_path("sub/dir.db") == os.path.join(base, "sub", "dir.db")
+    assert appmod.resolve_db_path("  spaced.db  ") == os.path.join(base, "spaced.db")
