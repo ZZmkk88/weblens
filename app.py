@@ -24,7 +24,19 @@ from pydantic import BaseModel
 from starlette.middleware.body_limit import RequestBodyLimitMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = os.environ.get("WEBLENS_DB_PATH", str(BASE_DIR / "data" / "weblens.db"))
+def resolve_db_path(raw_value: str | None) -> str:
+    # 相对路径按 app.py 所在目录解析，不跟进程的当前工作目录走；
+    # 否则换目录启动会另建一套带默认口令的新库。
+    # （与 README「相对 app.py 所在目录」的声明一致。）
+    value = (raw_value or "").strip()
+    if not value:
+        return str(BASE_DIR / "data" / "weblens.db")
+    if os.path.isabs(value):
+        return value
+    return str(BASE_DIR / value)
+
+
+DB_PATH = resolve_db_path(os.environ.get("WEBLENS_DB_PATH"))
 TOKEN_TTL_SECONDS = 24 * 60 * 60
 INITIAL_USERNAME = os.environ.get("WL_INITIAL_USERNAME", "admin")
 INITIAL_PASSWORD = os.environ.get("WL_INITIAL_PASSWORD", "admin123")
